@@ -88,6 +88,15 @@ function parseNatsUrl(u) {
  */
 const NON_FATAL_ERR = /permissions violation|invalid subject/i;
 
+/**
+ * A non-fatal `-ERR` that nonetheless means our publishes are being refused.
+ *
+ * Non-fatal only describes the CONNECTION; the eye is publish-only, so a
+ * standing publish denial makes that connection useless to us even though the
+ * socket stays up.
+ */
+const PUBLISH_DENIED_ERR = /permissions violation for publish/i;
+
 /** @returns {boolean} true when this `-ERR` should cost us the connection. */
 function isFatalNatsError(line) {
   return !NON_FATAL_ERR.test(line);
@@ -112,9 +121,18 @@ class AttentionBridge {
     this._published = 0;
     this._dropped = 0;
     this._lastError = null;
+    // Set when the broker refuses publishes to SUBJECT. NATS has no per-message
+    // ack, so `_published` is necessarily optimistic — but a publish-permission
+    // denial is not per-message, it is standing: every subsequent PUB to this
+    // subject will be refused too. Once we have seen one there is no longer any
+    // basis for calling a write a delivery. Cleared on reconnect. (#71)
+    this._publishDenied = false;
   }
 
   connect() {
+    // A reconnect may land on a broker with different authz, so the standing
+    // denial does not survive it.
+    this._publishDenied = false;
     const parsed = parseNatsUrl(this._url);
     const { host, port } = parsed;
     // Auth precedence (#22): explicit env vars win, then credentials embedded
@@ -177,6 +195,19 @@ class AttentionBridge {
           // Non-fatal: scoped to the offending operation, connection stays
           // usable. Reconnecting here would loop without fixing anything.
           console.warn(`[attention-bridge] NATS error: ${line}`);
+          // …but if the refused operation is publishing to OUR subject, the
+          // connection being usable is cold comfort: the eye's only reason to
+          // hold it is gone. This -ERR is the broker's response to the PUB we
+          // just counted as delivered, so reconcile that count and stop
+          // claiming delivery until a reconnect proves otherwise. Pre-fix
+          // /api/attention/stats showed a rising `published` while the broker
+          // refused every single glyph. (#71)
+          if (PUBLISH_DENIED_ERR.test(line) && !this._publishDenied) {
+            this._publishDenied = true;
+            console.warn("[attention-bridge] broker refuses publishes to " +
+              `${SUBJECT} — counting glyphs as dropped until reconnect`);
+            if (this._published > 0) { this._published--; this._dropped++; }
+          }
         }
       }
     });
@@ -208,7 +239,21 @@ class AttentionBridge {
    * @param {string} sourceType "text" | "bytes" | "numbers"
    */
   publishGlyph(glyph, sourceType) {
-    if (!this._connected || !this._client) {
+    const sock = this._client;
+    // `_connected` is a CACHED flag updated from the 'close' event, and that
+    // event lands a tick or more after the socket is actually gone. During a
+    // reconnect window the flag still said connected, write() on the dead
+    // socket did not throw, and the glyph was counted as delivered — so
+    // /api/attention/stats overstated delivery exactly when transport churn
+    // made it matter. Ask the socket, not the cache. (#72)
+    if (!this._connected || !sock || sock.destroyed || sock.writable === false) {
+      // Correct the stale flag rather than waiting for 'close', so stats read
+      // true immediately and the reconnect path is not delayed.
+      if (sock && (sock.destroyed || sock.writable === false)) this._connected = false;
+      this._dropped++;
+      return false;
+    }
+    if (this._publishDenied) {
       this._dropped++;
       return false;
     }
@@ -242,7 +287,10 @@ class AttentionBridge {
     const payload = JSON.stringify(envelope);
     const payloadBytes = Buffer.byteLength(payload, "utf-8");
     try {
-      this._client.write(`PUB ${SUBJECT} ${payloadBytes}\r\n${payload}\r\n`);
+      // A `false` return is BACKPRESSURE, not failure — the frame is buffered
+      // and will flush on 'drain'. Treating it as a drop would invent losses on
+      // any large payload, so the liveness check above is what guards delivery.
+      sock.write(`PUB ${SUBJECT} ${payloadBytes}\r\n${payload}\r\n`);
       this._published++;
       return true;
     } catch (e) {
@@ -261,6 +309,10 @@ class AttentionBridge {
       // auth/permissions reason says WHY rather than just "connected: false".
       lastError: this._lastError,
       reconnectPending: this._reconnectTimer != null,
+      // Connected but refused: the socket is up and `connected` is true, yet
+      // every glyph is being dropped at the broker. Without this the two look
+      // identical from outside. (#71)
+      publishDenied: this._publishDenied,
     };
   }
 }

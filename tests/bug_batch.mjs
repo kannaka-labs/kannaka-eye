@@ -40,6 +40,18 @@
  *        (pre-fix: -ERR only logged, and _scheduleReconnect() is reachable
  *        only from 'close' — a broker that rejected auth without closing left
  *        the bridge permanently dead).
+ *   #64  radio's own `running: false` beats Eye's reachability inference
+ *        (pre-fix: `running: true` was a literal on the "we got JSON" branch,
+ *        so a stopped radio answering 200 read as live).
+ *   #68  no class id decodes to an impossible h2=4 (pre-fix: everything above
+ *        83 was aliased to 95, collapsing twelve ids onto one point outside
+ *        the advertised 0..3 range).
+ *   #71  a publish the broker REFUSES is not counted as published (pre-fix:
+ *        a standing permissions denial left `published` climbing while the
+ *        broker accepted nothing).
+ *   #72  a write to an already-destroyed socket is not a delivery (pre-fix:
+ *        the cached `_connected` flag lags the 'close' event, so glyphs sent
+ *        into a dead socket during reconnect churn counted as published).
  *
  * Usage: node tests/bug_batch.mjs   (exit 0 iff all pass)
  */
@@ -49,6 +61,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import net from "net";
 import http from "http";
+import { readFileSync } from "fs";
 
 import { AttentionBridge, parseNatsUrl, isFatalNatsError, resolveNatsUrl, DEFAULT_NATS_URL } from "../attention-bridge.js";
 
@@ -124,7 +137,10 @@ function startStubRadio() {
   // copy of the initial value in kannaka-radio's server/perception.js. Every
   // field is PRESENT and zeroed, which is precisely why the #16 "no perception
   // fields" guard does not catch it. (#56)
-  const state = { idle: false };
+  // `state.stateBody`, when set, is served from /api/state — the endpoint the
+  // constellation surfaces poll to decide whether Radio is up. Null means 404,
+  // i.e. radio unreachable, which is the default for every other test here.
+  const state = { idle: false, stateBody: null };
   const IDLE = {
     mel_spectrogram: Array(128).fill(0),
     mfcc: Array(13).fill(0),
@@ -143,6 +159,9 @@ function startStubRadio() {
         res.end(JSON.stringify(
           state.idle ? IDLE : { tempo_bpm: 0, valence: 0.5, rms_energy: 0.25 },
         ));
+      } else if (req.url === "/api/state" && state.stateBody) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(state.stateBody));
       } else {
         res.writeHead(404);
         res.end("{}");
@@ -243,6 +262,98 @@ async function main() {
     if (bridge._reconnectTimer) clearTimeout(bridge._reconnectTimer);
     for (const s of held) { try { s.destroy(); } catch { /* ignore */ } }
     broker.close();
+  }
+
+  // ── #72: a write to a dead socket is not a delivery ──
+  //
+  // `_connected` is updated from the 'close' event, which lands a tick or more
+  // after the socket is actually gone. Publishing in that window wrote to a
+  // destroyed socket, did not throw, and counted as delivered — so stats
+  // overstated delivery during exactly the reconnect churn that loses glyphs.
+  {
+    const glyph = { foldSequence: [1], amplitudes: [1], phases: [0] };
+
+    const dead = new AttentionBridge({ url: "nats://127.0.0.1:1" });
+    dead._connected = true; // stale flag: 'close' has not fired yet
+    dead._client = { destroyed: true, writable: false, writes: [], write(d) { this.writes.push(d); return false; } };
+    const deadOk = dead.publishGlyph(glyph, "text");
+    check("#72 publishing to a destroyed socket returns false",
+      deadOk === false, `got ${deadOk}`);
+    check("#72 nothing is written to a destroyed socket",
+      dead._client.writes.length === 0, `wrote ${dead._client.writes.length} frame(s)`);
+    check("#72 the glyph is counted as dropped, not published",
+      dead.stats().published === 0 && dead.stats().dropped === 1,
+      `stats=${JSON.stringify(dead.stats())}`);
+    check("#72 the stale connected flag is corrected on the spot",
+      dead.stats().connected === false,
+      "stats must not keep claiming connected once the socket is known dead");
+
+    // The guard must not cost a healthy publish.
+    const live = new AttentionBridge({ url: "nats://127.0.0.1:1" });
+    live._connected = true;
+    live._client = { destroyed: false, writable: true, writes: [], write(d) { this.writes.push(d); return true; } };
+    check("#72 a live socket still publishes",
+      live.publishGlyph(glyph, "text") === true && live.stats().published === 1,
+      `stats=${JSON.stringify(live.stats())}`);
+    check("#72 backpressure (write returning false) is not treated as a drop",
+      (() => {
+        const bp = new AttentionBridge({ url: "nats://127.0.0.1:1" });
+        bp._connected = true;
+        bp._client = { destroyed: false, writable: true, write() { return false; } };
+        return bp.publishGlyph(glyph, "text") === true && bp.stats().dropped === 0;
+      })(),
+      "a false return means the frame is buffered for 'drain', not lost");
+  }
+
+  // ── #71: a publish the broker refuses is not a publish ──
+  //
+  // A permissions violation is non-fatal to the CONNECTION (#47) but standing
+  // for the SUBJECT: every later PUB is refused too. The bridge kept
+  // incrementing `published` anyway, so /api/attention/stats showed healthy
+  // delivery while the broker accepted nothing.
+  {
+    const glyph = { foldSequence: [1], amplitudes: [1], phases: [0] };
+    const socks = [];
+    const broker = net.createServer((sock) => {
+      socks.push(sock);
+      sock.setEncoding("utf-8");
+      sock.write("INFO {\"server_id\":\"deny\"}\r\n");
+      sock.on("error", () => {});
+      sock.on("data", (d) => {
+        if (d.includes("PING")) sock.write("PONG\r\n");
+        if (d.includes("PUB ")) sock.write("-ERR 'Permissions Violation for Publish to KANNAKA.attention.eye'\r\n");
+      });
+    });
+    const bport = await new Promise((res) => broker.listen(0, "127.0.0.1", () => res(broker.address().port)));
+    const bridge = new AttentionBridge({ url: `nats://127.0.0.1:${bport}` });
+    bridge.connect();
+    await new Promise((r) => setTimeout(r, 300));
+
+    check("#71 the bridge connects before the denial",
+      bridge.stats().connected === true, `stats=${JSON.stringify(bridge.stats())}`);
+    bridge.publishGlyph(glyph, "text");
+    await new Promise((r) => setTimeout(r, 300));
+
+    const st = bridge.stats();
+    check("#71 a refused publish is not counted as published",
+      st.published === 0, `stats=${JSON.stringify(st)}`);
+    check("#71 the refused glyph is counted as dropped",
+      st.dropped === 1, `stats=${JSON.stringify(st)}`);
+    check("#71 the standing denial is reported",
+      st.publishDenied === true,
+      `connected-but-refused must be distinguishable from delivering; stats=${JSON.stringify(st)}`);
+    check("#71 later glyphs are dropped rather than optimistically counted",
+      bridge.publishGlyph(glyph, "text") === false && bridge.stats().dropped === 2,
+      `stats=${JSON.stringify(bridge.stats())}`);
+    check("#71 the connection is NOT torn down — that would reconnect-loop",
+      bridge.stats().connected === true, `stats=${JSON.stringify(bridge.stats())}`);
+
+    if (bridge._reconnectTimer) clearTimeout(bridge._reconnectTimer);
+    if (bridge._client) { try { bridge._client.destroy(); } catch { /* ignore */ } }
+    for (const s of socks) { try { s.destroy(); } catch { /* ignore */ } }
+    broker.close();
+    await new Promise((r) => setTimeout(r, 50));
+    if (bridge._reconnectTimer) clearTimeout(bridge._reconnectTimer);
   }
 
   const stub = await startStubRadio();
@@ -457,6 +568,86 @@ async function main() {
       check("#46 SVG does not light an Attention node while disconnected",
         !svg.body.includes(">Attention<"),
         "a dark bridge must not render as an active constellation node");
+    }
+
+    // ── #64: radio's own "not running" beats our reachability inference ──
+    //
+    // #17 already stopped a non-2xx from reading as up. What remained is the
+    // opposite direction: a healthy 200 whose BODY says the service is
+    // stopped was still reported as running, because `running: true` was a
+    // literal on the "we got JSON" branch.
+    {
+      stub.state.stateBody = { running: false, currentAlbum: "Nothing", playlist: [], currentTrackIdx: 0 };
+      const body = JSON.parse((await request(port, "/api/constellation")).body);
+      check("#64 an explicit running:false is not reported as running",
+        body.radio && body.radio.running === false,
+        `radio=${JSON.stringify(body.radio)}`);
+      check("#64 reachable stays true — radio answered, it is just stopped",
+        body.radio && body.radio.reachable === true,
+        `reachable must distinguish "answered 200" from "is running"; radio=${JSON.stringify(body.radio)}`);
+      const svgStopped = await request(port, "/api/constellation.svg");
+      check("#64 SVG reports radio OFF for a stopped radio",
+        /radio:OFF/.test(svgStopped.body), "status line still claims radio:ON");
+      check("#64 SVG does not light a Radio node for a stopped radio",
+        !svgStopped.body.includes(">Radio<"),
+        "a stopped radio must not render as an active constellation node");
+
+      // …and a radio that does not self-report is still trusted as running,
+      // which is the shape kannaka-radio's real /api/state actually has.
+      stub.state.stateBody = { currentAlbum: "Live", current: { title: "T" } };
+      const up = JSON.parse((await request(port, "/api/constellation")).body);
+      check("#64 a payload with no `running` field is still reported running",
+        up.radio && up.radio.running === true && up.radio.reachable === true,
+        `radio=${JSON.stringify(up.radio)}`);
+      stub.state.stateBody = null;
+    }
+
+    // ── #68: no class decodes to an impossible h2 ──
+    //
+    // Both decoders aliased anything above 83 to 95, which decodes to h2=4 —
+    // outside 0..3 in the eye's own 84-class space AND outside canonical's.
+    // Twelve distinct ids became one impossible point. The native classifier
+    // does emit those ids (canonical dominant_class 91 is in kannaka-memory's
+    // reference vectors) and the served page decodes whatever /api/process
+    // returns, so this is reachable, not theoretical.
+    //
+    // NOT under test: that 84..95 decode to twelve DISTINCT points. The eye's
+    // 84-class JS decode is a deliberate divergence from canonical's 96-class
+    // scheme — see the contract note at the top of sga_consistency.mjs.
+    {
+      const page = await request(port, "/");
+      const src = page.body;
+      const start = src.indexOf("function decodeClassIndexClient(");
+      let depth = 0, entered = false, i = start;
+      for (; i < src.length; i++) {
+        const ch = src[i];
+        if (ch === "{") { depth++; entered = true; }
+        else if (ch === "}") { depth--; if (entered && depth === 0) { i++; break; } }
+      }
+      const decode = eval(`(${src.slice(start, i).replace("function decodeClassIndexClient", "function")})`);
+      const bad = [];
+      for (let c = 0; c <= 95; c++) {
+        const { h2, d, l } = decode(c);
+        if (!(h2 >= 0 && h2 <= 3) || !(d >= 0 && d <= 2) || !(l >= 0 && l <= 6)) {
+          bad.push(`${c}->{h2:${h2},d:${d},l:${l}}`);
+        }
+      }
+      check("#68 every class 0..95 decodes inside the advertised ranges",
+        bad.length === 0, `out of range: ${bad.slice(0, 5).join(" ")}`);
+      check("#68 canonical class 91 no longer decodes to h2=4",
+        decode(91).h2 === 3, `got ${JSON.stringify(decode(91))}`);
+      check("#68 classes at or below 83 are untouched",
+        decode(83).h2 === 3 && decode(83).d === 2 && decode(83).l === 6 && decode(27).h2 === 1,
+        `83->${JSON.stringify(decode(83))} 27->${JSON.stringify(decode(27))}`);
+      // The server-side twin is not reachable through any endpoint — the eye's
+      // own classifier clamps to 83 before it ever decodes — so this one is
+      // source-level. Comment lines are stripped first: the prose explaining
+      // the fix names the old constant, and would otherwise satisfy itself.
+      const serverCode = readFileSync(join(EYE_DIR, "server.js"), "utf8")
+        .split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+      check("#68 the server-side decoder matches",
+        !/classIndex\s*=\s*95/.test(serverCode),
+        "server.js still aliases out-of-range classes to 95");
     }
   } catch (e) {
     console.error(`Fatal: ${e.message}`);

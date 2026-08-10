@@ -469,8 +469,20 @@ function calculateEntropy(bytes) {
  * Decode class index to components (h2, d, l)
  */
 function decodeClassIndex(classIndex) {
-  if (classIndex > 83) classIndex = 95;
-  
+  // The eye's JS decode is an 84-class space (h2 0..3, d 0..2, l 0..6) and
+  // stays that way ON PURPOSE — it is snapshot-tested against this repo's own
+  // golden vectors in tests/sga_reference_vectors.json, NOT against
+  // kannaka-memory's canonical 96-class Rust encoder. Do not "align" it.
+  //
+  // What was wrong is the out-of-range branch. `classIndex = 95` decoded to
+  // h2=4, which does not exist in either space — 84..95 all collapsed to one
+  // impossible centroid. The native classifier really does emit those ids
+  // (canonical dominant_class 91 appears in kannaka-memory's vectors) and the
+  // client renderer decodes whatever /api/process returns, so this branch is
+  // reachable. Clamp into the space this decoder actually describes. (#68)
+  if (classIndex > 83) classIndex = 83;
+  if (!(classIndex >= 0)) classIndex = 0;
+
   const h2 = Math.floor(classIndex / 21);
   const remainder = classIndex % 21;
   const d = Math.floor(remainder / 7);
@@ -1153,8 +1165,12 @@ const FANO_LINES_CLIENT = ${JSON.stringify(FANO_LINES)};
 const FANO_COLORS_CLIENT = ${JSON.stringify(FANO_COLORS)};
 
 function decodeClassIndexClient(classIndex) {
-  if (classIndex > 83) classIndex = 95;
-  
+  // Mirrors the server's decodeClassIndex — see the note there. Clamping into
+  // the 84-class space instead of aliasing to 95 keeps h2 inside 0..3; the old
+  // branch put every class above 83 at the same impossible h2=4 point. (#68)
+  if (classIndex > 83) classIndex = 83;
+  if (!(classIndex >= 0)) classIndex = 0;
+
   const h2 = Math.floor(classIndex / 21);
   const remainder = classIndex % 21;
   const d = Math.floor(remainder / 7);
@@ -2283,10 +2299,17 @@ const server = http.createServer((req, res) => {
       // Attention lights only while the NATS bridge is actually connected —
       // same honesty rule as Radio and Memory above. A dark Attention node is
       // the visible signal that glyphs are being dropped. (#46)
-      const attentionOk = attentionBridge.stats().connected;
+      // Connected-but-refused is not delivering. A bridge whose publishes the
+      // broker rejects lit the Attention node exactly like a working one. (#71)
+      const attentionStats = attentionBridge.stats();
+      const attentionOk = attentionStats.connected && !attentionStats.publishDenied;
+      // `radioState` non-null means radio answered 2xx with parseable JSON
+      // (#17). It does not mean radio considers itself running — honour an
+      // explicit self-report over our reachability inference. (#64)
+      const radioRunning = !!radioState && radioState.running !== false;
       const dots = [];
       dots.push({ idx: 0, source: "eye", label: "Eye" });
-      if (radioState) dots.push({ idx: 3, source: "radio", label: "Radio" });
+      if (radioRunning) dots.push({ idx: 3, source: "radio", label: "Radio" });
       if (nativeOk) dots.push({ idx: 6, source: "memory", label: "Memory" });
       if (attentionOk) dots.push({ idx: 5, source: "attention", label: "Attention" });
 
@@ -2326,7 +2349,7 @@ const server = http.createServer((req, res) => {
       // Status text
       svg += `  <text x="200" y="380" text-anchor="middle" fill="#555" font-family="monospace" font-size="10">`;
       const memoryStatus = nativeOk ? "NATIVE" : (KANNAKA_BIN ? "UNVERIFIED" : "OFF");
-      svg += `eye:ON radio:${radioState ? "ON" : "OFF"} memory:${memoryStatus} attention:${attentionOk ? "ON" : "OFF"}`;
+      svg += `eye:ON radio:${radioRunning ? "ON" : "OFF"} memory:${memoryStatus} attention:${attentionOk ? "ON" : "OFF"}`;
       svg += `</text>\n`;
       svg += `</svg>`;
 
@@ -2519,11 +2542,18 @@ setInterval(refresh, 10000);
         radioState?.current?.title ||
         radioState?.playlist?.[radioState?.currentTrackIdx]?.title ||
         null;
+      // `reachable` is what we actually measured: radio answered 2xx with
+      // parseable JSON (#17). `running` used to be hardcoded true from that,
+      // so a payload declaring itself stopped was still reported as running.
+      // Radio's own /api/state carries no `running` field today, so this only
+      // changes behaviour for a payload that explicitly says otherwise —
+      // which is the point: report the self-report, not our inference. (#64)
       checks.radio = radioState ? {
-        running: true,
+        reachable: true,
+        running: radioState.running !== false,
         currentAlbum: radioState.currentAlbum,
         track: currentTrack,
-      } : { running: false };
+      } : { reachable: false, running: false };
 
       // The Eye->Attention NATS link is part of the constellation, but this
       // surface used to omit it entirely: a dead bridge left /api/constellation
@@ -2537,6 +2567,9 @@ setInterval(refresh, 10000);
         dropped: a.dropped,
         reconnectPending: a.reconnectPending,
         lastError: a.lastError,
+        // Connected and dropping every glyph is a distinct state from both
+        // connected-and-delivering and disconnected. (#71)
+        publishDenied: a.publishDenied,
       };
 
       res.writeHead(200, { "Content-Type": "application/json" });
