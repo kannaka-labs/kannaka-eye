@@ -12,7 +12,7 @@
 
 `kannaka-eye` is the constellation's vision modality. Any input — text, files, audio, raw bytes — gets rendered as its emergent **SGA glyph**: a geometric signature that lives in the same coordinate system as the Holographic Resonance Medium's chiral hemispheres. The glyph is what the substrate's right hemisphere "sees" when it encounters that input.
 
-[![License](https://img.shields.io/badge/license-MIT-blueviolet)]() [![Node](https://img.shields.io/badge/node-20-green)]()
+[![License](https://img.shields.io/badge/license-Space%20Child%20v1.0-blueviolet)]() [![Node](https://img.shields.io/badge/node-20-green)]()
 
 ---
 
@@ -96,4 +96,4 @@ Open <http://localhost:8889> and drop something in. The eye renders the SGA glyp
 
 ## License
 
-MIT.
+Space Child License v1.0. See [LICENSE](./LICENSE).
