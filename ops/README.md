@@ -10,7 +10,7 @@ pulls same-Fano-line memories into the beam (gravity), and serves O(K) recall.
 
 ```bash
 # on the box:
-cd /home/opc && git clone https://github.com/NickFlach/kannaka-eye.git   # first time
+cd /home/opc && git clone https://github.com/kannaka-labs/kannaka-eye.git   # first time
 cd /home/opc/kannaka-eye && git pull                                      # updates
 chmod +x ops/run-eye.sh
 sudo install -m644 ops/kannaka-eye.service /etc/systemd/system/kannaka-eye.service

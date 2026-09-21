@@ -111,5 +111,5 @@ kannaka-eye/
 
 ## Source
 
-- **Repository:** https://github.com/NickFlach/kannaka-eye
+- **Repository:** https://github.com/kannaka-labs/kannaka-eye
 - **License:** Space Child License v1.0
