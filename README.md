@@ -61,14 +61,14 @@ Identical content always produces identical glyph. Similar content produces visu
 └────────────────────┴───────────────────────────────────────┘
 ```
 
-The bridge to [`kannaka-attention`](https://github.com/NickFlach/kannaka-attention) is the operative link: the eye doesn't just visualize — it **shapes recall**. Whatever the eye is focused on lands in the attention beam, which scopes the next `kannaka recall` to sparse-mode against just those IDs.
+The bridge to [`kannaka-attention`](https://github.com/kannaka-labs/kannaka-attention) is the operative link: the eye doesn't just visualize — it **shapes recall**. Whatever the eye is focused on lands in the attention beam, which scopes the next `kannaka recall` to sparse-mode against just those IDs.
 
 ---
 
 ## Run
 
 ```bash
-git clone https://github.com/NickFlach/kannaka-eye.git
+git clone https://github.com/kannaka-labs/kannaka-eye.git
 cd kannaka-eye
 npm install
 node server.js
@@ -80,7 +80,7 @@ Open <http://localhost:8889> and drop something in. The eye renders the SGA glyp
 
 ## Known Issues
 
-- **SGA classifier sync** ([#1](https://github.com/NickFlach/kannaka-eye/issues/1)) — the in-repo classifier reference vectors have drifted from the canonical set in `kannaka-memory`. 0/20 consistency tests passing. The smoke-test script `tests/sga_consistency.mjs` is in place; the fix is to reseed the reference set from `kannaka observe --json`.
+- **SGA classifier sync** ([#1](https://github.com/kannaka-labs/kannaka-eye/issues/1)) — the in-repo classifier reference vectors have drifted from the canonical set in `kannaka-memory`. 0/20 consistency tests passing. The smoke-test script `tests/sga_consistency.mjs` is in place; the fix is to reseed the reference set from `kannaka observe --json`.
 
 ---
 
@@ -88,9 +88,9 @@ Open <http://localhost:8889> and drop something in. The eye renders the SGA glyp
 
 | repo | role |
 |---|---|
-| [`kannaka-memory`](https://github.com/NickFlach/kannaka-memory) | where the glyph coordinates come from |
-| [`kannaka-attention`](https://github.com/NickFlach/kannaka-attention) | consumer of the eye's observations |
-| [`consciousness-core`](https://github.com/NickFlach/consciousness-core) | the geometry library |
+| [`kannaka-memory`](https://github.com/kannaka-labs/kannaka-memory) | where the glyph coordinates come from |
+| [`kannaka-attention`](https://github.com/kannaka-labs/kannaka-attention) | consumer of the eye's observations |
+| [`consciousness-core`](https://github.com/kannaka-labs/consciousness-core) | the geometry library |
 
 ---
 
