@@ -52,6 +52,11 @@
  *   #72  a write to an already-destroyed socket is not a delivery (pre-fix:
  *        the cached `_connected` flag lags the 'close' event, so glyphs sent
  *        into a dead socket during reconnect churn counted as published).
+ *   #83  /api/radio maps Radio's unipolar valence [0,1] to bytes 0..255
+ *        (pre-fix: `(v + 1) * 127.5` put valence 0 at byte 128).
+ *   #88  a Radio that never answers gets ONE 504 and Eye stays up (pre-fix:
+ *        the timeout and the follow-on 'error' both wrote a response, and
+ *        the second write threw ERR_HTTP_HEADERS_SENT and killed the server).
  *
  * Usage: node tests/bug_batch.mjs   (exit 0 iff all pass)
  */
@@ -140,7 +145,7 @@ function startStubRadio() {
   // `state.stateBody`, when set, is served from /api/state — the endpoint the
   // constellation surfaces poll to decide whether Radio is up. Null means 404,
   // i.e. radio unreachable, which is the default for every other test here.
-  const state = { idle: false, stateBody: null };
+  const state = { idle: false, stateBody: null, valence: 0.5 };
   const IDLE = {
     mel_spectrogram: Array(128).fill(0),
     mfcc: Array(13).fill(0),
@@ -157,7 +162,7 @@ function startStubRadio() {
       if (req.url === "/api/perception") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(
-          state.idle ? IDLE : { tempo_bpm: 0, valence: 0.5, rms_energy: 0.25 },
+          state.idle ? IDLE : { tempo_bpm: 0, valence: state.valence, rms_energy: 0.25 },
         ));
       } else if (req.url === "/api/state" && state.stateBody) {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -527,6 +532,27 @@ async function main() {
         `features=${JSON.stringify(body.features)}`);
     }
 
+    // ── #83: valence is unipolar [0,1] → 0..255 ──
+    //
+    // Radio's perception.js clamps valence to [0,1]. The bipolar mapping
+    // `(v + 1) * 127.5` sent valence 0 to byte 128, so calm tracks read as
+    // mid-high valence and the low half of byte space was unreachable.
+    // features = [tempo, valence, rms] with this stub, so valence is index 1.
+    {
+      const cases = [[0, 0], [0.5, 128], [1, 255], [-0.2, 0], [1.4, 255]];
+      try {
+        for (const [v, want] of cases) {
+          stub.state.valence = v;
+          const body = JSON.parse((await request(port, "/api/radio")).body);
+          const got = Array.isArray(body.features) ? body.features[1] : undefined;
+          check(`#83 valence ${v} maps to byte ${want}`, got === want,
+            `features=${JSON.stringify(body.features)}`);
+        }
+      } finally {
+        stub.state.valence = 0.5;
+      }
+    }
+
     // ── #46: constellation surfaces must include the attention bridge ──
     //
     // The server under test has no NATS broker, so its bridge is down and
@@ -656,6 +682,55 @@ async function main() {
   } finally {
     child.kill();
     stub.srv.close();
+  }
+
+  // ── #88: a Radio that never answers must not crash Eye ──
+  //
+  // /api/radio gives up after 3s and destroys the request; Node then emits
+  // 'error' on it as well. Both handlers wrote a response, the second threw
+  // ERR_HTTP_HEADERS_SENT, and the Eye process died under a correct 504.
+  // Own server + a stub that accepts and never replies.
+  {
+    const held = [];
+    const hang = http.createServer((req) => { held.push(req.socket); });
+    const hangPort = await new Promise((r) => hang.listen(0, "127.0.0.1", () => r(hang.address().port)));
+    const eyePort = await getFreePort();
+    const eye = spawn(process.execPath, ["server.js", "--port", String(eyePort)], {
+      cwd: EYE_DIR,
+      env: {
+        ...process.env,
+        KANNAKA_BIN: FAKE_BIN,
+        EYE_PORT: "",
+        NATS_URL: "nats://127.0.0.1:1",
+        RADIO_URL: `http://127.0.0.1:${hangPort}`,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let eyeLog = "";
+    let exited = null;
+    eye.stdout.on("data", (d) => (eyeLog += d));
+    eye.stderr.on("data", (d) => (eyeLog += d));
+    eye.on("exit", (code, sig) => { exited = { code, sig }; });
+    try {
+      await waitReady(eyePort);
+      const r = await request(eyePort, "/api/radio");
+      check("#88 a hanging radio gets a 504", r.status === 504, `status=${r.status} body=${r.body.slice(0, 120)}`);
+      check("#88 the 504 names the timeout", /Radio timeout/.test(r.body), `body=${r.body.slice(0, 120)}`);
+      // Give the follow-on 'error' event time to land.
+      await new Promise((res) => setTimeout(res, 750));
+      check("#88 Eye is still running after the timeout", exited === null,
+        `exited=${JSON.stringify(exited)}\n${eyeLog.slice(-600)}`);
+      check("#88 no double response was attempted", !/ERR_HTTP_HEADERS_SENT/.test(eyeLog),
+        eyeLog.slice(-600));
+      const again = await request(eyePort, "/api/attention/stats").catch((e) => ({ status: 0, body: e.message }));
+      check("#88 Eye still serves requests afterwards", again.status === 200, `status=${again.status}`);
+    } catch (e) {
+      check("#88 timeout scenario ran", false, `${e.message}\n${eyeLog.slice(-600)}`);
+    } finally {
+      eye.kill();
+      for (const s of held) { try { s.destroy(); } catch { /* ignore */ } }
+      hang.close();
+    }
   }
 
   console.log("---");

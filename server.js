@@ -2105,6 +2105,19 @@ const server = http.createServer((req, res) => {
     const { mod: radioMod, target } = radioRequest("/api/perception");
     const radioUrl = target.toString();
 
+    // Exactly one response per request. On a timeout the request is
+    // destroyed, and Node then emits 'error' on it too; both handlers used to
+    // write, so the second writeHead threw ERR_HTTP_HEADERS_SENT and took the
+    // whole Eye down. A slow body can also time out while the success path is
+    // still awaiting the glyph build. First writer wins; the rest no-op. (#88)
+    let replied = false;
+    const reply = (status, body) => {
+      if (replied || res.headersSent || res.writableEnded) return;
+      replied = true;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+
     const radioReq = radioMod.get(target, { timeout: 3000 }, (radioRes) => {
       let data = "";
       radioRes.on("data", chunk => data += chunk);
@@ -2115,12 +2128,11 @@ const server = http.createServer((req, res) => {
           // through to classifyData, producing a confident-looking glyph
           // built from the literal bytes of the error string. (#6)
           if (radioRes.statusCode < 200 || radioRes.statusCode >= 300) {
-            res.writeHead(radioRes.statusCode === 404 ? 502 : (radioRes.statusCode || 502), { "Content-Type": "application/json" });
-            res.end(JSON.stringify({
+            reply(radioRes.statusCode === 404 ? 502 : (radioRes.statusCode || 502), {
               error: "radio_upstream_error",
               upstream_status: radioRes.statusCode,
               detail: data.slice(0, 200),
-            }));
+            });
             return;
           }
           const perception = JSON.parse(data);
@@ -2141,17 +2153,16 @@ const server = http.createServer((req, res) => {
           // broadcast perception over WS when `status === 'no_perception'` —
           // so this is honouring an existing contract, not inventing one. (#56)
           if (perception && perception.status === "no_perception") {
-            res.writeHead(200, { "Content-Type": "application/json" });
             // 200, not 5xx: radio is healthy and answering, it simply has
             // nothing to perceive. `idle`/`status` are the machine-readable
             // signal; `error` is kept because it is the field the preset UI
             // renders — without it the client falls through to classifying
             // `radio.features`, which would be undefined here.
-            res.end(JSON.stringify({
+            reply(200, {
               idle: true,
               status: "no_perception",
               error: "Radio is idle — nothing playing, so there is no perception to render",
-            }));
+            });
             return;
           }
 
@@ -2176,11 +2187,13 @@ const server = http.createServer((req, res) => {
           // Add tempo, valence, energy as bytes — clamp both ends so a
           // negative valence or runaway tempo can't poison classifyData
           // (which requires byte ∈ [0,255] to land in any band, see #9).
-          // Valence is treated as bipolar [-1, 1] → [0, 255]; if a future
-          // radio profile emits unipolar [0, 1] this still clamps cleanly.
+          // Valence is unipolar [0, 1] in Radio's contract (perception.js
+          // clamps it there), so it maps like mel/mfcc/rms: 0 → 0, 1 → 255.
+          // Pre-fix it was treated as bipolar, `(v + 1) * 127.5`, which put
+          // valence 0 at byte 128 and made the low half unreachable. (#83)
           const clampByte = (v) => Math.max(0, Math.min(255, Math.round(v)));
           if (perception.tempo_bpm != null) features.push(clampByte(perception.tempo_bpm));
-          if (perception.valence != null)   features.push(clampByte((perception.valence + 1) * 127.5));
+          if (perception.valence != null)   features.push(clampByte(perception.valence * 255));
           if (perception.rms_energy != null) features.push(clampByte(perception.rms_energy * 255));
 
           if (features.length === 0) {
@@ -2189,11 +2202,10 @@ const server = http.createServer((req, res) => {
             // {"error":"radio_offline"} — into a confident-looking glyph.
             // Now we refuse: if Radio didn't send any of the expected
             // perception keys we treat it as an upstream failure. (#16)
-            res.writeHead(502, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({
+            reply(502, {
               error: "radio_no_perception_fields",
               detail: "upstream response lacked mel_spectrogram, mfcc, tempo_bpm, valence, and rms_energy",
-            }));
+            });
             return;
           }
 
@@ -2220,8 +2232,7 @@ const server = http.createServer((req, res) => {
             try { attentionBridge.publishGlyph(glyph, "audio"); }
             catch (e) { console.warn(`[eye] radio attention publish failed: ${e.message}`); }
           }
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
+          reply(200, {
             source: "kannaka-radio",
             track: trackTitle,
             album: albumTitle,
@@ -2229,21 +2240,19 @@ const server = http.createServer((req, res) => {
             featureCount: features.length,
             glyph: glyph || null,
             radioOrigin: radioOrigin(),
-          }));
+          });
         } catch (e) {
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Failed to parse radio perception", detail: e.message }));
+          reply(502, { error: "Failed to parse radio perception", detail: e.message });
         }
       });
     });
     radioReq.on("error", () => {
-      res.writeHead(503, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Radio not reachable", radioUrl }));
+      reply(503, { error: "Radio not reachable", radioUrl });
     });
     radioReq.on("timeout", () => {
+      // Answer first so the 504 wins over the 'error' that destroy() emits.
+      reply(504, { error: "Radio timeout" });
       radioReq.destroy();
-      res.writeHead(504, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Radio timeout" }));
     });
     return;
   }
